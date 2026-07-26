@@ -408,7 +408,8 @@ FETCH_API_JS_TEMPLATE = """
             salary_source: j.salaryDesc ? 'api' : 'api_empty',
             location: (j.cityName || '') + '\\u00b7' + (j.areaDistrict || '') + '\\u00b7' + (j.businessDistrict || ''),
             tags: [j.jobExperience || '', j.jobDegree || ''].filter(function(t){return t && t !== '\\u4e0d\\u9650';}).join(' | '),
-            boss_name: j.brandName || '',
+            boss_name: j.bossName || '',
+            company_name: j.brandName || '',
             boss_title: j.bossTitle || '',
             boss_active_status: j.activeTimeDesc || (j.bossOnline ? '\\u5728\\u7ebf' : ''),
             company_scale: j.brandScaleName || '',
@@ -427,6 +428,32 @@ FETCH_API_JS_TEMPLATE = """
         };
     });
     return JSON.stringify(results);
+})()
+"""
+
+# ============================================================
+# 通过公司页面提取完整公司名（补全被 BOSS API 截断的 brandName）
+# 策略：从页面 innerText 中定位"企业名称"和"法定代表人"之间的文本
+# ============================================================
+FETCH_COMPANY_NAME_JS = """
+(function(){
+    var t = document.body ? document.body.innerText : '';
+    if (!t) return '';
+
+    var a = t.indexOf('企业名称');
+    var b = t.indexOf('法定代表人', a);
+    if (a < 0 || b < 0) return '';
+
+    var s = t.substring(a, b);
+    var nl = String.fromCharCode(10);
+    var lines = s.split(nl).filter(function(l) { return l.trim(); });
+
+    // "企业名称：" 是第一行���公司全名是第二行
+    if (lines.length > 1) {
+        var name = lines[1].trim();
+        if (name && name.length > 2) return name;
+    }
+    return '';
 })()
 """
 
@@ -1082,13 +1109,14 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
 # ============================================================
 CSV_COLUMNS = [
     "job_id", "title", "salary", "salary_source", "location", "tags", "boss_name",
+    "company_name",
     "boss_active_status",
     "company_scale", "company_stage", "company_industry", "skills",
     "job_link", "welfare",
 ]
 
 DETAIL_CSV_COLUMNS = [
-    "job_id", "title", "company", "salary", "salary_source", "location",
+    "job_id", "title", "company", "boss_name", "salary", "salary_source", "location",
     "boss_active_status", "tags_list", "job_link", "skill_tags", "jd",
 ]
 
@@ -1354,6 +1382,60 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 
 
 # ============================================================
+# 补全被 BOSS API 截断的公司名（访问公司页面提取完整名称）
+# ============================================================
+def resolve_truncated_company_names(all_jobs, cdp, sid):
+    """对于 brandName 被截断（含 '...'或'··'）的岗位，
+    通过 CDP 访问 BOSS 公司页面提取完整工商名。
+
+    只对每个唯一 encrypt_brand_id 访问一次，共享结果。
+    """
+    # 收集需要补全的唯一 encrypt_brand_id
+    needs_resolution = {}
+    for j in all_jobs:
+        bn = j.get('company_name', '')
+        ebid = j.get('encrypt_brand_id', '')
+        if ('...' in bn or '··' in bn) and ebid and ebid not in needs_resolution:
+            needs_resolution[ebid] = bn
+
+    if not needs_resolution:
+        return
+
+    print(f"\n--- 补全公司名: {len(needs_resolution)} 家 ---")
+
+    resolved = {}
+    for ebid, old_name in sorted(needs_resolution.items()):
+        company_url = f"https://www.zhipin.com/gongsi/{ebid}.html"
+        try:
+            cdp.send("Page.navigate", {"url": company_url}, sid)
+            time.sleep(random.uniform(1.5, 3.0))
+            full_name = cdp.eval_js(FETCH_COMPANY_NAME_JS, sid)
+            if full_name and full_name != old_name and '...' not in full_name and len(full_name) > 2:
+                resolved[ebid] = full_name
+                print(f"  ✓ {old_name} → {full_name}")
+            else:
+                print(f"  ✗ {old_name} — 未获取到完整名"
+                      f" (got: {full_name!r})")
+        except Exception as e:
+            print(f"  ✗ {old_name} — 错误: {e}")
+
+        # 适度延迟，避免风控
+        time.sleep(random.uniform(4.0, 6.0))
+
+    # 更新岗位数据
+    updated = 0
+    for j in all_jobs:
+        ebid = j.get('encrypt_brand_id', '')
+        if ebid in resolved:
+            j['company_name'] = resolved[ebid]
+            updated += 1
+        else:
+            pass  # company_name already set from JS template
+
+    print(f"  已更新 {updated} 条岗位的公司名")
+
+
+# ============================================================
 # 抓取列表
 # ============================================================
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
@@ -1492,7 +1574,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 extra = f" | {scale}" if scale else ""
                 if active:
                     extra += f" | {active}"
-                print(f"  ✓ {j['title']} | {salary} | {j.get('location','')} | {j.get('boss_name','')}{extra}")
+                print(f"  ✓ {j['title']} | {salary} | {j.get('location','')} | {j.get('company_name','')}{extra}")
 
             print(f"  本页 {len(jobs)} 条, 新增 {new}, 累计 {len(all_jobs)}")
 
@@ -1510,6 +1592,24 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 d = random.uniform(12, 22)
                 print(f"  翻页等待 {d:.0f}s...\n")
                 time.sleep(d)
+
+        # 补全被截断的公司名（访问公司页面获取完整工商名）
+        resolve_truncated_company_names(all_jobs, cdp, sid)
+
+        # 最终写入（含完整公司名）
+        if output_path:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            final_meta = {
+                "keyword": keyword,
+                "city": city_name,
+                "filters": filters,
+                "filter_desc": filter_desc,
+                "scraped_at": datetime.now().isoformat(),
+                "total": len(all_jobs),
+                "jobs": all_jobs,
+            }
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(final_meta, f, ensure_ascii=False, indent=2)
 
     except KeyboardInterrupt:
         print("\n中断")
@@ -1555,7 +1655,8 @@ def build_detail_record(job, extracted):
     return {
         "job_id": job.get("job_id", ""),
         "title": job.get("title", ""),
-        "company": job.get("boss_name", ""),
+        "company": job.get("company_name", ""),
+        "boss_name": job.get("boss_name", ""),
         "salary": job.get("salary", ""),
         "salary_source": job.get("salary_source", ""),
         "location": job.get("location", ""),
@@ -1583,7 +1684,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
         title = job.get("title", "")
-        company = job.get("boss_name", "")
+        company = job.get("company_name", "")
         if not link:
             continue
 
@@ -1829,7 +1930,7 @@ def analyze(list_data, details=None, search_keyword=""):
     print(f"\n--- 高频公司 ---")
     company_count = Counter()
     for j in jobs:
-        c = j.get("boss_name", "")
+        c = j.get("company_name", "")
         if c:
             company_count[c] += 1
     for c, n in company_count.most_common(10):
